@@ -2,6 +2,9 @@ import authentication.Authentication;
 import authentication.User;
 import camellia.Camellia;
 import camellia.CamelliaOFB;
+import keydelivery.KeyEncapsulator;
+import mceliece.McEliece;
+import mceliece.McElieceKeyDelivery;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -19,9 +22,16 @@ public class SecureFileExchangeApp {
 
     private User loggedInUser; // null when logged out
 
+    // Key delivery (McEliece)
+    private final McEliece mceliece;
+    private final KeyEncapsulator keyDelivery;
+
     public SecureFileExchangeApp(Authentication auth) {
         this.auth = auth;
         this.scanner = new Scanner(System.in);
+
+        this.mceliece = new McEliece();
+        this.keyDelivery = new McElieceKeyDelivery(mceliece);
     }
 
     public void run() throws Exception {
@@ -62,6 +72,7 @@ public class SecureFileExchangeApp {
         System.out.println("2) View my inbox (encrypted files)");
         System.out.println("3) Decrypt a file from my inbox");
         System.out.println("4) Logout");
+        System.out.println("5) View my McEliece keys (public/private)");
         System.out.println("0) Exit");
         System.out.print("Choose: ");
 
@@ -71,6 +82,7 @@ public class SecureFileExchangeApp {
             case "2" -> listInboxFlow();
             case "3" -> decryptFromInboxFlow();
             case "4" -> logoutFlow();
+            case "5" -> viewMyKeysFlow();
             case "0" -> {
                 System.out.println("Bye.");
                 System.exit(0);
@@ -144,23 +156,25 @@ public class SecureFileExchangeApp {
         Path encOut = recipientInbox.resolve(baseName + "." + messageId + ".enc");
         Files.write(encOut, ciphertext);
 
-        // TEMP KEY STORAGE (ONLY until McEliece key delivery is added)
-        // TODO: Replace this .key file with McEliece encryption of (sessionKey||iv).
+        // Encrypt ONLY the session key using recipient's McEliece public key
+        byte[] encryptedSessionKey = keyDelivery.encryptSessionKey(sessionKey, recipient);
+
+        // Save key metadata to recipient inbox (.key)
         Path keyOut = recipientInbox.resolve(baseName + "." + messageId + ".key");
         Files.writeString(keyOut,
                 "sender=" + loggedInUser.getUsername() + "\n" +
                         "recipient=" + recipient + "\n" +
-                        "sessionKeyHex=" + toHex(sessionKey) + "\n" +
+                        "encryptedSessionKeyHex=" + toHex(encryptedSessionKey) + "\n" +
                         "ivHex=" + toHex(iv) + "\n"
         );
 
-        // Save a copy in sender 'sent' folder (optional but nice)
+        // Save a copy in sender 'sent' folder (optional)
         Path senderSent = SENT_DIR.resolve(loggedInUser.getUsername());
         Files.write(senderSent.resolve(baseName + "." + messageId + ".enc"), ciphertext);
 
         System.out.println("✅ Sent encrypted file to " + recipient);
         System.out.println("📨 Saved: " + encOut.toAbsolutePath());
-        System.out.println("⚠️ TEMP key file (will be McEliece later): " + keyOut.toAbsolutePath());
+        System.out.println("🔐 Encrypted session key saved in: " + keyOut.toAbsolutePath());
     }
 
     // -------------------------
@@ -220,12 +234,17 @@ public class SecureFileExchangeApp {
         Path keyFile = myInbox.resolve(keyName);
 
         if (!Files.exists(keyFile)) {
-            System.out.println("❌ Missing .key file (temporary key delivery placeholder).");
+            System.out.println("❌ Missing .key file.");
             return;
         }
 
         Map<String, String> keyData = readKeyFile(keyFile);
-        byte[] sessionKey = fromHex(keyData.get("sessionKeyHex"));
+
+        // Recover session key using receiver's McEliece private key
+        byte[] encryptedSessionKey = fromHex(keyData.get("encryptedSessionKeyHex"));
+        byte[] sessionKey = keyDelivery.decryptSessionKey(encryptedSessionKey, loggedInUser.getUsername());
+
+        // IV is not secret, stored plaintext
         byte[] iv = fromHex(keyData.get("ivHex"));
 
         byte[] ciphertext = Files.readAllBytes(encFile);
@@ -249,6 +268,45 @@ public class SecureFileExchangeApp {
     }
 
     // -------------------------
+    // View keys (demo/debug)
+    // -------------------------
+    private void viewMyKeysFlow() {
+        System.out.println("\n--- My McEliece Keys ---");
+
+        String u = loggedInUser.getUsername();
+
+        McEliece.PublicKey pk = mceliece.getPublicKey(u);
+        McEliece.PrivateKey sk = mceliece.getPrivateKey(u);
+
+        System.out.println("User: " + u);
+        System.out.println("Params: n=" + pk.params().n() + ", k=" + pk.params().k() + ", t=" + pk.params().t());
+        System.out.println();
+
+        System.out.println("Public Key (G matrix) rows (k rows, each is n bits):");
+        printMatrix(pk.Grows(), pk.params().n());
+
+        System.out.println();
+        System.out.println("Private Key (H matrix) rows (r rows, each is n bits):");
+        printMatrix(sk.Hrows(), sk.params().n());
+
+        System.out.println("\n⚠️ Note: Showing private keys is only for demo/testing.");
+    }
+
+    private static void printMatrix(BitSet[] rows, int nBits) {
+        for (int i = 0; i < rows.length; i++) {
+            System.out.printf("Row %02d: %s%n", i, bitSetTo01(rows[i], nBits));
+        }
+    }
+
+    private static String bitSetTo01(BitSet bs, int nBits) {
+        StringBuilder sb = new StringBuilder(nBits);
+        for (int i = 0; i < nBits; i++) {
+            sb.append(bs.get(i) ? '1' : '0');
+        }
+        return sb.toString();
+    }
+
+    // -------------------------
     // Storage init
     // -------------------------
     private void initStorage() throws IOException {
@@ -259,6 +317,7 @@ public class SecureFileExchangeApp {
         for (String u : List.of("helalha", "rober", "sherbel")) {
             Files.createDirectories(INBOX_DIR.resolve(u));
             Files.createDirectories(SENT_DIR.resolve(u));
+            mceliece.ensureUser(u); // ensure McEliece keys exist for each user
         }
     }
 
