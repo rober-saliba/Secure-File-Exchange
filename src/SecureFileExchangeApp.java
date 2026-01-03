@@ -150,27 +150,31 @@ public class SecureFileExchangeApp {
         byte[] ciphertext = ofb.transform(iv, fileBytes);
 
         // Save to recipient inbox
-        String baseName = filePath.getFileName().toString();
         String messageId = UUID.randomUUID().toString().substring(0, 8);
+        Path bundleDir = recipientInbox.resolve(messageId);
+        Files.createDirectories(bundleDir);
 
-        Path encOut = recipientInbox.resolve(baseName + "." + messageId + ".enc");
+        Path encOut = bundleDir.resolve("payload.enc");
         Files.write(encOut, ciphertext);
 
-        // Encrypt ONLY the session key using recipient's McEliece public key
         byte[] encryptedSessionKey = keyDelivery.encryptSessionKey(sessionKey, recipient);
 
-        // Save key metadata to recipient inbox (.key)
-        Path keyOut = recipientInbox.resolve(baseName + "." + messageId + ".key");
+        Path keyOut = bundleDir.resolve("key.txt");
         Files.writeString(keyOut,
                 "sender=" + loggedInUser.getUsername() + "\n" +
                         "recipient=" + recipient + "\n" +
+                        "originalFilename=" + filePath.getFileName() + "\n" +
                         "encryptedSessionKeyHex=" + toHex(encryptedSessionKey) + "\n" +
                         "ivHex=" + toHex(iv) + "\n"
         );
 
+
         // Save a copy in sender 'sent' folder (optional)
-        Path senderSent = SENT_DIR.resolve(loggedInUser.getUsername());
-        Files.write(senderSent.resolve(baseName + "." + messageId + ".enc"), ciphertext);
+        Path senderSent = SENT_DIR.resolve(loggedInUser.getUsername()).resolve(messageId);
+        Files.createDirectories(senderSent);
+        Files.write(senderSent.resolve("payload.enc"), ciphertext);
+        Files.writeString(senderSent.resolve("key.txt"), Files.readString(keyOut));
+
 
         System.out.println("✅ Sent encrypted file to " + recipient);
         System.out.println("📨 Saved: " + encOut.toAbsolutePath());
@@ -184,16 +188,26 @@ public class SecureFileExchangeApp {
         System.out.println("\n--- My Inbox ---");
         Path myInbox = INBOX_DIR.resolve(loggedInUser.getUsername());
 
-        List<Path> encFiles = listFilesByExtension(myInbox, ".enc");
-        if (encFiles.isEmpty()) {
-            System.out.println("(empty)");
-            return;
+        List<Path> bundles = listDirectories(myInbox);
+        if (bundles.isEmpty()) { System.out.println("(empty)"); return; }
+
+        for (int i = 0; i < bundles.size(); i++) {
+            System.out.println((i + 1) + ") " + bundles.get(i).getFileName());
         }
 
-        for (int i = 0; i < encFiles.size(); i++) {
-            System.out.println((i + 1) + ") " + encFiles.get(i).getFileName());
+    }
+
+    //helper for list Inbox flow ()
+    private static List<Path> listDirectories(Path dir) throws IOException {
+        if (!Files.exists(dir)) return List.of();
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir)) {
+            List<Path> out = new ArrayList<>();
+            for (Path p : ds) if (Files.isDirectory(p)) out.add(p);
+            out.sort(Comparator.comparing(a -> a.getFileName().toString()));
+            return out;
         }
     }
+
 
     // -------------------------
     // Decrypt from inbox
@@ -202,17 +216,19 @@ public class SecureFileExchangeApp {
         System.out.println("\n--- Decrypt From Inbox ---");
         Path myInbox = INBOX_DIR.resolve(loggedInUser.getUsername());
 
-        List<Path> encFiles = listFilesByExtension(myInbox, ".enc");
-        if (encFiles.isEmpty()) {
+        // 1) list message bundles (directories)
+        List<Path> bundles = listDirectories(myInbox);
+        if (bundles.isEmpty()) {
             System.out.println("(empty)");
             return;
         }
 
-        for (int i = 0; i < encFiles.size(); i++) {
-            System.out.println((i + 1) + ") " + encFiles.get(i).getFileName());
+        // show bundle IDs (folder names)
+        for (int i = 0; i < bundles.size(); i++) {
+            System.out.println((i + 1) + ") " + bundles.get(i).getFileName());
         }
 
-        System.out.print("Choose file number to decrypt: ");
+        System.out.print("Choose message number to decrypt: ");
         String numStr = scanner.nextLine().trim();
         int idx;
         try {
@@ -221,51 +237,58 @@ public class SecureFileExchangeApp {
             System.out.println("Invalid number.");
             return;
         }
-        if (idx < 0 || idx >= encFiles.size()) {
+        if (idx < 0 || idx >= bundles.size()) {
             System.out.println("Invalid selection.");
             return;
         }
 
-        Path encFile = encFiles.get(idx);
+        // 2) selected bundle directory
+        Path bundleDir = bundles.get(idx);
 
-        // Find matching .key file
-        String encName = encFile.getFileName().toString();
-        String keyName = encName.replace(".enc", ".key");
-        Path keyFile = myInbox.resolve(keyName);
+        // 3) expected files inside bundle
+        Path encFile = bundleDir.resolve("payload.enc");
+        Path keyFile = bundleDir.resolve("key.txt");
 
+        if (!Files.exists(encFile)) {
+            System.out.println("❌ Missing payload.enc in: " + bundleDir.getFileName());
+            return;
+        }
         if (!Files.exists(keyFile)) {
-            System.out.println("❌ Missing .key file.");
+            System.out.println("❌ Missing key.txt in: " + bundleDir.getFileName());
             return;
         }
 
+        // 4) read key data
         Map<String, String> keyData = readKeyFile(keyFile);
 
-        // Recover session key using receiver's McEliece private key
         byte[] encryptedSessionKey = fromHex(keyData.get("encryptedSessionKeyHex"));
         byte[] sessionKey = keyDelivery.decryptSessionKey(encryptedSessionKey, loggedInUser.getUsername());
 
-        // IV is not secret, stored plaintext
         byte[] iv = fromHex(keyData.get("ivHex"));
 
+        // 5) decrypt payload.enc
         byte[] ciphertext = Files.readAllBytes(encFile);
 
         Camellia cam = new Camellia(sessionKey);
         CamelliaOFB ofb = new CamelliaOFB(cam);
         byte[] plaintext = ofb.transform(iv, ciphertext);
 
-        // Output decrypted file to a "downloads" folder
+        // 6) output decrypted file
         Path downloads = DATA_DIR.resolve("downloads").resolve(loggedInUser.getUsername());
         Files.createDirectories(downloads);
 
-        String outName = encName.replace(".enc", ".decrypted");
-        Path outFile = downloads.resolve(outName);
+        String originalName = keyData.getOrDefault("originalFilename", bundleDir.getFileName().toString());
+        String outName = originalName + ".decrypted";
 
+        Path outFile = downloads.resolve(outName);
         Files.write(outFile, plaintext);
 
         System.out.println("✅ Decrypted file created:");
         System.out.println(outFile.toAbsolutePath());
         System.out.println("Sender: " + keyData.getOrDefault("sender", "(unknown)"));
+        System.out.println("Message ID: " + bundleDir.getFileName());
     }
+
 
     // -------------------------
     // View keys (demo/debug)
