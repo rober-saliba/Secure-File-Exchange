@@ -5,6 +5,9 @@ import camellia.CamelliaOFB;
 import keydelivery.KeyEncapsulator;
 import mceliece.McEliece;
 import mceliece.McElieceKeyDelivery;
+import ecdsa.ECDSA;
+import ecdsa.ECPoint;
+import java.math.BigInteger;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -117,6 +120,7 @@ public class SecureFileExchangeApp {
     // -------------------------
     // Send (encrypt) file
     // -------------------------
+
     private void sendFileFlow() throws Exception {
         System.out.println("\n--- Send File ---");
         System.out.print("Enter recipient username (e.g. rober / sherbel / helalha): ");
@@ -140,6 +144,16 @@ public class SecureFileExchangeApp {
 
         byte[] fileBytes = Files.readAllBytes(filePath);
 
+        // --- NEW: Generate ECDSA Signature ---
+        // 1. Generate keys for sender (In a real app, you load these from disk)
+        System.out.println("✍️  Signing file with ECDSA...");
+        BigInteger signingKey = ECDSA.generatePrivateKey();
+        ECPoint signingPubKey = ECDSA.generatePublicKey(signingKey);
+
+        // 2. Sign the ORIGINAL file bytes (before encryption)
+        ECDSA.Signature signature = ECDSA.sign(fileBytes, signingKey);
+        // -------------------------------------
+
         // Generate session key + IV
         byte[] sessionKey = randomBytes(16);
         byte[] iv = randomBytes(16);
@@ -159,15 +173,22 @@ public class SecureFileExchangeApp {
 
         byte[] encryptedSessionKey = keyDelivery.encryptSessionKey(sessionKey, recipient);
 
+        // --- NEW: Save Signature & Public Key to key.txt ---
         Path keyOut = bundleDir.resolve("key.txt");
         Files.writeString(keyOut,
                 "sender=" + loggedInUser.getUsername() + "\n" +
                         "recipient=" + recipient + "\n" +
                         "originalFilename=" + filePath.getFileName() + "\n" +
                         "encryptedSessionKeyHex=" + toHex(encryptedSessionKey) + "\n" +
-                        "ivHex=" + toHex(iv) + "\n"
+                        "ivHex=" + toHex(iv) + "\n" +
+                        // We add these new lines to store the signature:
+                        //(r,s) sign ,(x,y) public key
+                        "signatureR=" + signature.r().toString(16) + "\n" +
+                        "signatureS=" + signature.s().toString(16) + "\n" +
+                        "pubKeyX=" + signingPubKey.x().toString(16) + "\n" +
+                        "pubKeyY=" + signingPubKey.y().toString(16) + "\n"
         );
-
+        // ---------------------------------------------------
 
         // Save a copy in sender 'sent' folder (optional)
         Path senderSent = SENT_DIR.resolve(loggedInUser.getUsername()).resolve(messageId);
@@ -175,8 +196,7 @@ public class SecureFileExchangeApp {
         Files.write(senderSent.resolve("payload.enc"), ciphertext);
         Files.writeString(senderSent.resolve("key.txt"), Files.readString(keyOut));
 
-
-        System.out.println("✅ Sent encrypted file to " + recipient);
+        System.out.println("✅ Sent encrypted & signed file to " + recipient);
         System.out.println("📨 Saved: " + encOut.toAbsolutePath());
         System.out.println("🔐 Encrypted session key saved in: " + keyOut.toAbsolutePath());
     }
@@ -212,6 +232,7 @@ public class SecureFileExchangeApp {
     // -------------------------
     // Decrypt from inbox
     // -------------------------
+
     private void decryptFromInboxFlow() throws Exception {
         System.out.println("\n--- Decrypt From Inbox ---");
         Path myInbox = INBOX_DIR.resolve(loggedInUser.getUsername());
@@ -266,27 +287,55 @@ public class SecureFileExchangeApp {
 
         byte[] iv = fromHex(keyData.get("ivHex"));
 
-        // 5) decrypt payload.enc
+        // 5) decrypt payload.enc (We keep it in memory 'plaintext', we DO NOT save it yet)
         byte[] ciphertext = Files.readAllBytes(encFile);
 
         Camellia cam = new Camellia(sessionKey);
         CamelliaOFB ofb = new CamelliaOFB(cam);
         byte[] plaintext = ofb.transform(iv, ciphertext);
 
-        // 6) output decrypted file
+        // Prepare path for saving (but don't write yet)
         Path downloads = DATA_DIR.resolve("downloads").resolve(loggedInUser.getUsername());
         Files.createDirectories(downloads);
-
         String originalName = keyData.getOrDefault("originalFilename", bundleDir.getFileName().toString());
         String outName = originalName + ".decrypted";
-
         Path outFile = downloads.resolve(outName);
-        Files.write(outFile, plaintext);
 
-        System.out.println("✅ Decrypted file created:");
-        System.out.println(outFile.toAbsolutePath());
-        System.out.println("Sender: " + keyData.getOrDefault("sender", "(unknown)"));
-        System.out.println("Message ID: " + bundleDir.getFileName());
+        // ---  Verify ECDSA Signature FIRST ---
+        System.out.println("🔍 Verifying digital signature...");
+
+        if (keyData.containsKey("signatureR")) {
+            // 1. Parse signature components
+            BigInteger r = new BigInteger(keyData.get("signatureR"), 16);
+            BigInteger s = new BigInteger(keyData.get("signatureS"), 16);
+            ECDSA.Signature sig = new ECDSA.Signature(r, s);
+
+            // 2. Parse Sender Public Key
+            BigInteger qx = new BigInteger(keyData.get("pubKeyX"), 16);
+            BigInteger qy = new BigInteger(keyData.get("pubKeyY"), 16);
+            ECPoint senderPubKey = new ECPoint(qx, qy);
+
+            // 3. Verify
+            boolean valid = ECDSA.verify(plaintext, sig, senderPubKey);
+
+            if (valid) {
+                // ✅ SUCCESS: Now we save the file
+                Files.write(outFile, plaintext);
+
+                System.out.println("✅ SIGNATURE VALID: The file is authentic and unchanged.");
+                System.out.println("✅ Decrypted file saved to:");
+                System.out.println(outFile.toAbsolutePath());
+                System.out.println("Sender: " + keyData.getOrDefault("sender", "(unknown)"));
+            } else {
+                // ❌ FAILURE: We throw it away
+                System.out.println("⚠️ WARNING: SIGNATURE INVALID! File may be tampered.");
+                System.out.println("🛑 SECURITY ALERT: The file was NOT saved to disk for your safety.");
+            }
+        } else {
+            System.out.println("⚠️ No signature found in metadata. Cannot verify authenticity.");
+            System.out.println("File not saved.");
+        }
+        // -----------------------------------
     }
 
 

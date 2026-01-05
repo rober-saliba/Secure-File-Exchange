@@ -1,5 +1,0 @@
-sender=helalha
-recipient=rober
-originalFilename=input.txt
-encryptedSessionKeyHex=205eb363c1ea0c6230eda3fb96834deabf36327d4b3a90fc703e170489b49aaf
-ivHex=99dc456ad751904d8d20f520b71bbba2
