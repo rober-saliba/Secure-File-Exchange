@@ -55,6 +55,8 @@ The system follows a rigorous process to ensure end-to-end security:
    ```bash
    git clone [https://github.com/rober-saliba/Secure-File-Exchange.git](https://github.com/rober-saliba/Secure-File-Exchange.git)
 2.Add Dependencies: Ensure the Bouncy Castle JAR files are included in your project build path.
+
+
 3.Run the Server:
  ```bash
 java Server
